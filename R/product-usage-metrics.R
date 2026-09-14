@@ -1,11 +1,7 @@
 # Metric registry for the "Product usage" tab and its "Methodology" tab.
 #
-# One row per output id in product-usage-panel.R. This is the single source
-# of truth for hover text (pu_hover()) and the methodology tables
-# (product_usage_methods_ui()), so a metric's description is written once.
-# `method` must describe what the matching pu_* query in
-# product-usage-queries.R actually does, not a paraphrase of the catalog
-# question.
+# One row per output id in product-usage-panel.R; feeds pu_hover() and
+# product_usage_methods_ui(). `method` describes the pu_* query as written.
 
 #' Build one catalog row
 #' @noRd
@@ -446,9 +442,7 @@ pu_hover <- function(output_id) {
   row <- catalog[catalog$output_id == output_id, ]
   stopifnot(nrow(row) == 1)
 
-  # The tooltip attributes sit on a wrapper span, not on the icon: Fomantic
-  # draws the tooltip arrow with `[data-tooltip]:before { content: '' }`,
-  # which replaces the glyph an `i.icon` also renders through `:before`.
+  # Tooltip attrs on a span: Fomantic's [data-tooltip]:before erases the icon glyph.
   shiny::tags$span(
     `data-tooltip` = paste(row$what, row$value),
     `data-position` = "top left",

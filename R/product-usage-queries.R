@@ -1,14 +1,7 @@
 # Product-usage metric queries.
 #
-# Each function below answers one question from the usage-db catalog
-# (question numbers refer to the NAS `questions.md` catalog) against the
-# `v_*` reporting views installed by `ensure_usage_views()`. Every function
-# shares the signature `(data_storage, date_from, date_to, environment =
-# NULL)`: `date_from`/`date_to` bound the query on whichever timestamp the
-# source view is keyed on (session login time or event time), and
-# `environment` narrows to one environment string (`NULL` means all). These
-# are internal helpers consumed by `product_usage_server()`, not part of the
-# package's public API.
+# One function per questions.md item, over the v_* views from ensure_usage_views().
+# Signature: (data_storage, date_from, date_to, environment = NULL); NULL = all.
 
 #' Build the 3 positional params ($1 date_from, $2 date_to, $3 environment)
 #' shared by every product-usage query.
@@ -445,9 +438,9 @@ pu_tab_first_last <- function(data_storage, date_from, date_to, environment = NU
 pu_heatmap_duration_by_sample_bucket <- function(data_storage, date_from, date_to, environment = NULL) {
   data_storage$query(
     r"(
-    SELECT width_bucket(s.n_samples, 0, 500, 10) AS sample_bucket,
-           ((width_bucket(s.n_samples, 0, 500, 10) - 1) * 50)::text || '-' ||
-             (width_bucket(s.n_samples, 0, 500, 10) * 50)::text AS bucket_label,
+    SELECT width_bucket(s.n_samples, 0, 10000, 20) AS sample_bucket,
+           ((width_bucket(s.n_samples, 0, 10000, 20) - 1) * 500)::text || '-' ||
+             (width_bucket(s.n_samples, 0, 10000, 20) * 500)::text AS bucket_label,
            percentile_cont(0.5) WITHIN GROUP (ORDER BY s.duration_ms) AS median_ms,
            count(*) AS n
     FROM v_heatmap_runs s
