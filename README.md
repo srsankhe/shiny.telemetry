@@ -104,6 +104,27 @@ The setup for plumber requires a valid Plumber instance running on the network
 and the communication can be protected.
 See Plumber deployment documentation for more information.
 
+## Product usage tab (Alamar fork)
+
+This fork adds a "Product usage" tab to the analytics dashboard
+(`analytics_app()`), read-side only, on top of a Postgres `DataStorageSQLFamily`
+connection (e.g. `DataStoragePostgreSQL`).
+
+The tab reads from a set of `v_*` SQL views layered over `event_log`
+(`inst/sql/usage-db.schema.sql`: indexes, JSON accessor functions, and
+reporting views such as `v_sessions`, `v_feature_events`, `v_time_on_tab`).
+Install or update them once, by hand, with a role allowed to create functions
+and views:
+
+```r
+ensure_usage_views(data_storage)
+```
+
+`ensure_usage_views()` is idempotent (`CREATE OR REPLACE` / `IF NOT EXISTS`) and
+is meant to run from an admin session against the usage database, never from
+the instrumented app itself. If the views are missing, the tab shows a status
+message instead of failing.
+
 ## Debugging the Telemetry calls
 
 The package uses the `logger` package internally with the `shiny.telemetry` namespace.
