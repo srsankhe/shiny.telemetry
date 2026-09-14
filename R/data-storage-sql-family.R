@@ -9,6 +9,27 @@ DataStorageSQLFamily <- R6::R6Class( # nolint object_name.
   #
   # Public
   public = list(
+
+    #' @description Run a parameterized read-only query against the
+    #' underlying connection.
+    #' @param statement SQL string, using `$1`, `$2`, ... placeholders for
+    #' `params`.
+    #' @param params (optional) list of positional parameters to bind.
+    #'
+    #' @return A [`dplyr::tibble()`] with the query result.
+    query = function(statement, params = NULL) {
+      odbc::dbGetQuery(private$db_con, statement, params = params) %>%
+        dplyr::tibble()
+    },
+
+    #' @description Run a single SQL statement with no parameters (DDL,
+    #' e.g. `CREATE VIEW`) against the underlying connection.
+    #' @param statement SQL string.
+    #'
+    #' @return The number of rows affected, invisibly.
+    execute = function(statement) {
+      invisible(odbc::dbExecute(private$db_con, statement))
+    }
   ),
   #
   # Private

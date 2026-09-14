@@ -50,6 +50,16 @@ analytics_ui <- function() {
         icon = semantic.dashboard::icon("history")
       ),
       semantic.dashboard::menuItem(
+        text = "Product usage",
+        tabName = "product_usage",
+        icon = semantic.dashboard::icon("chart line")
+      ),
+      semantic.dashboard::menuItem(
+        text = "Methodology",
+        tabName = "product_usage_methods",
+        icon = semantic.dashboard::icon("book")
+      ),
+      semantic.dashboard::menuItem(
         text = shiny::HTML(paste("Tools", semantic.dashboard::icon("wrench"))),
         semantic.dashboard::menuSubItem(
           text = shiny::HTML(paste(
@@ -182,6 +192,12 @@ analytics_ui <- function() {
       ),
       semantic.dashboard::tabItem(
         tabName = "sessions", global_session_stats, session_specific_stats
+      ),
+      semantic.dashboard::tabItem(
+        tabName = "product_usage", product_usage_ui()
+      ),
+      semantic.dashboard::tabItem(
+        tabName = "product_usage_methods", product_usage_methods_ui()
       )
     )
   )
@@ -202,6 +218,8 @@ analytics_server <- function(data_storage) {
       session,
       data_storage = data_storage
     )
+
+    product_usage_server(input, output, session, data_storage)
   })
 }
 
