@@ -151,6 +151,18 @@ pu_metric_catalog <- function() {
       question = "Q3"
     ),
     pu_row(
+      "usage_recent_sessions_table", "Who", "Sessions (pod id for log lookup)",
+      "One row per session in the window: start time, user, environment, version, pod id, minutes, events, errors.",
+      "The pod id is what the NAS account dropdown shows the user and what Log Analytics indexes pod logs by, so a support request can be traced from this row to the pod's logs.",
+      paste(
+        "pu_recent_sessions selects login_time, username, environment, app_version, pod,",
+        "duration_s / 60, n_events and n_errors from v_sessions, filtered on login_time in the",
+        "date window and environment, newest first, capped at 500 rows."
+      ),
+      caveats = "pod comes from app_name on every row (new shape ENV/version/pod, or the legacy User Session suffix) with session_context as fallback; sessions whose pod was killed have no logout and NULL minutes.",
+      question = ""
+    ),
+    pu_row(
       "usage_users_per_org_table", "Who", "Users per org",
       "Table of distinct user counts, one row per organization.",
       "Shows which orgs are most active by user count.",
