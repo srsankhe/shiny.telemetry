@@ -20,12 +20,14 @@
 --      appear for genuinely multi-valued fields (e.g. export.formats).
 --   ev_text()/ev_int()/ev_bool() below handle both shapes transparently.
 --
--- TWO `app_name` SHAPES (old rows vs new rows)
---   Old:  "App:nulisa-analysis-software; User Session:<pod-name>"  (no environment)
---   New:  "nas/<ENVIRONMENT>/<version>"  e.g. "nas/PROD/v2.0"
---   Every view that surfaces `environment`/`app_version` returns NULL for rows
---   written before the app_name change ships. Do not assume environment is
---   always populated.
+-- `app_name` IS THE PER-ROW CONTEXT COLUMN, NOT A NAME
+--   This database holds one application, so app_name carries context:
+--   New:  "<ENVIRONMENT>/<version>/<pod>"  e.g. "PROD/v2.0/abc123-0"
+--   Old:  "App:nulisa-analysis-software; User Session:<pod>"  (pod only)
+--   Older: "nulisa-analysis-software", "demo", "NULISA Analysis Software" (nothing)
+--   The pod id is what the NAS account dropdown shows the user and what Log
+--   Analytics indexes pod logs by; it is the link from a user's report to logs
+--   and to these rows. environment/app_version are NULL on old rows.
 --
 -- HOW TO APPLY
 --   No DDL owner or migration tooling exists for this database (same situation
@@ -215,22 +217,29 @@ SELECT
     e.type,
     e.details,
     public.safe_jsonb(e.details) AS details_json,
-    CASE WHEN e.app_name ~ '^nas/[^/]+/.+$'
-        THEN upper((regexp_match(e.app_name, '^nas/([^/]+)/(.+)$'))[1])
+    CASE WHEN e.app_name ~ '^[^/[:space:]:;]+/[^/]+/[^/]+$'
+        THEN upper((regexp_match(e.app_name, '^([^/]+)/([^/]+)/([^/]+)$'))[1])
         ELSE NULL
     END AS environment,
-    CASE WHEN e.app_name ~ '^nas/[^/]+/.+$'
-        THEN (regexp_match(e.app_name, '^nas/([^/]+)/(.+)$'))[2]
+    CASE WHEN e.app_name ~ '^[^/[:space:]:;]+/[^/]+/[^/]+$'
+        THEN (regexp_match(e.app_name, '^([^/]+)/([^/]+)/([^/]+)$'))[2]
         ELSE NULL
-    END AS app_version
+    END AS app_version,
+    CASE
+        WHEN e.app_name ~ '^[^/[:space:]:;]+/[^/]+/[^/]+$'
+            THEN (regexp_match(e.app_name, '^([^/]+)/([^/]+)/([^/]+)$'))[3]
+        WHEN e.app_name ~ 'User Session:'
+            THEN trim(regexp_replace(e.app_name, '^.*User Session:', ''))
+        ELSE NULL
+    END AS pod
 FROM public.event_log e;
 
 -- =============================================================================
 -- v_sessions -- one row per session token
 -- =============================================================================
--- environment/app_version/pod prefer session_context (new event); fall back
--- to app_name parsing (works on new app_name shape only, so still NULL on
--- legacy rows with no session_context and the old app_name shape).
+-- environment/app_version/pod come from app_name on every row; session_context
+-- is the fallback (and the only source of user_id/org_id). Old rows without
+-- environment/version stay NULL for those two columns; pod is still parsed.)
 -- user_id/org_id only ever come from session_context -- there is no legacy
 -- fallback for opaque ACC ids.
 
@@ -273,10 +282,7 @@ appname_ev AS (
         app_name,
         environment AS parsed_environment,
         app_version AS parsed_app_version,
-        CASE WHEN app_name ~ 'User Session:'
-            THEN trim(regexp_replace(app_name, '^.*User Session:', ''))
-            ELSE NULL
-        END AS parsed_pod
+        pod AS parsed_pod
     FROM public.v_events
     WHERE session IS NOT NULL
     ORDER BY session, "time" ASC
@@ -317,9 +323,9 @@ SELECT
     lo.logout_time,
     EXTRACT(EPOCH FROM (lo.logout_time - l.login_time)) AS duration_s,
     l.username,
-    COALESCE(c.ctx_environment, a.parsed_environment) AS environment,
-    COALESCE(c.ctx_app_version, a.parsed_app_version) AS app_version,
-    COALESCE(c.ctx_pod, a.parsed_pod) AS pod,
+    COALESCE(a.parsed_environment, c.ctx_environment) AS environment,
+    COALESCE(a.parsed_app_version, c.ctx_app_version) AS app_version,
+    COALESCE(a.parsed_pod, c.ctx_pod) AS pod,
     c.ctx_user_id AS user_id,
     c.ctx_org_id AS org_id,
     b.browser,

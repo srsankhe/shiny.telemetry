@@ -95,6 +95,24 @@ pu_users_per_org <- function(data_storage, date_from, date_to, environment = NUL
   )
 }
 
+#' Recent sessions with the pod id, for log lookup (not a catalog question)
+#' @keywords internal
+#' @noRd
+pu_recent_sessions <- function(data_storage, date_from, date_to, environment = NULL) {
+  data_storage$query(
+    r"(
+    SELECT s.login_time, s.username, s.environment, s.app_version, s.pod,
+           round(s.duration_s / 60.0, 1) AS minutes, s.n_events, s.n_errors
+    FROM v_sessions s
+    WHERE s.login_time >= $1::date AND s.login_time < ($2::date + 1)
+      AND ($3::text IS NULL OR s.environment = $3)
+    ORDER BY s.login_time DESC
+    LIMIT 500
+    )",
+    params = pu_params(date_from, date_to, environment)
+  )
+}
+
 #' Q4: week-over-week retention
 #' @keywords internal
 #' @noRd

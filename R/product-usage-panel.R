@@ -56,6 +56,8 @@ product_usage_ui <- function() {
     plotly::plotlyOutput("usage_daily_active_plot"),
     shiny::tags$h4("Users per org", pu_hover("usage_users_per_org_table")),
     DT::dataTableOutput("usage_users_per_org_table"),
+    shiny::tags$h4("Sessions (pod id for log lookup)", pu_hover("usage_recent_sessions_table")),
+    DT::dataTableOutput("usage_recent_sessions_table"),
     shiny::tags$h4("Week-over-week retention", pu_hover("usage_retention_plot")),
     plotly::plotlyOutput("usage_retention_plot")
   )
@@ -219,6 +221,7 @@ product_usage_server <- function(input, output, session, data_storage) {
 
   daily_active_data <- usage_reactive(pu_daily_active)
   users_per_org_data <- usage_reactive(pu_users_per_org)
+  recent_sessions_data <- usage_reactive(pu_recent_sessions)
   retention_data <- usage_reactive(pu_weekly_retention)
 
   feature_adoption_data <- usage_reactive(pu_feature_adoption)
@@ -317,6 +320,12 @@ product_usage_server <- function(input, output, session, data_storage) {
     d <- users_per_org_data()
     shiny::validate(shiny::need(nrow(d) > 0, "No data in this window"))
     DT::datatable(d, options = list(pageLength = 10, dom = "tp"))
+  })
+
+  output$usage_recent_sessions_table <- DT::renderDataTable({
+    d <- recent_sessions_data()
+    shiny::validate(shiny::need(nrow(d) > 0, "No sessions in this window"))
+    DT::datatable(d, options = list(pageLength = 10, dom = "ftp", order = list(list(0, "desc"))), rownames = FALSE)
   })
 
   output$usage_retention_plot <- plotly::renderPlotly({
