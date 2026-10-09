@@ -131,7 +131,13 @@ get_per_day_plot_data <- function(base, per_day) {
 prepare_admin_panel_components <- function(
   input, output, session, data_storage
 ) {
-  if (nrow(data_storage$read_event_data()) == 0) {
+  # SQL backends: probe one row instead of reading (and parsing) the default window.
+  has_data <- if (inherits(data_storage, "DataStorageSQLFamily")) {
+    nrow(data_storage$query(paste("SELECT 1 FROM", data_storage$event_bucket, "LIMIT 1"))) > 0
+  } else {
+    nrow(data_storage$read_event_data()) > 0
+  }
+  if (!has_data) {
     shiny.semantic::create_modal(
       shiny.semantic::modal(
         id = "no_data_modal",

@@ -235,6 +235,181 @@ SELECT
 FROM public.event_log e;
 
 -- =============================================================================
+-- ROLLUP TABLES -- usage_sessions / usage_tab_visits behind v_sessions / v_time_on_tab
+-- =============================================================================
+-- The legacy v_sessions rebuilt every session from all of event_log on every
+-- query (cost O(table), independent of the date window). These tables hold
+-- the same columns, refreshed incrementally. They start EMPTY: after the first
+-- apply, run the backfill once from an admin psql session with
+-- SET statement_timeout = 0:
+--   SELECT public.usage_refresh_range('-infinity');
+-- Then keep them fresh with SELECT public.usage_refresh(); (pg_cron or the
+-- dashboard, which calls it only once usage_sessions has rows).
+
+-- @@
+-- jsonb accessor with ev_text() semantics; SQL-inlinable, no exception block.
+CREATE OR REPLACE FUNCTION public.ev_jtext(j jsonb, k text) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE jsonb_typeof(j -> k)
+           WHEN 'array' THEN (j -> k) ->> 0
+           WHEN 'null'  THEN NULL
+           ELSE j ->> k
+         END
+$$;
+
+-- @@
+-- app_name parser: one regex pass per session instead of three per row.
+CREATE OR REPLACE FUNCTION public.usage_parse_app_name(a text, OUT environment text, OUT app_version text, OUT pod text)
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT upper(m[1]), m[2],
+         COALESCE(m[3], CASE WHEN a ~ 'User Session:' THEN trim(regexp_replace(a, '^.*User Session:', '')) END)
+  FROM (SELECT CASE WHEN a ~ '^[^/[:space:]:;]+/[^/]+/[^/]+$'
+                    THEN regexp_match(a, '^([^/]+)/([^/]+)/([^/]+)$') END AS m) t
+$$;
+
+-- @@
+-- One row per session token. Maintained by usage_refresh*(); v_sessions reads it.
+CREATE TABLE IF NOT EXISTS public.usage_sessions (
+    session          text PRIMARY KEY,
+    login_time       timestamp,
+    logout_time      timestamp,
+    duration_s       numeric,
+    username         text,
+    environment      text,
+    app_version      text,
+    pod              text,
+    user_id          text,
+    org_id           text,
+    browser          text,
+    n_events         bigint    NOT NULL,
+    n_errors         bigint    NOT NULL,
+    first_tab        text,
+    last_tab         text,
+    last_event_time  timestamp NOT NULL,
+    refreshed_at     timestamptz NOT NULL DEFAULT now()
+);
+
+-- @@
+CREATE INDEX IF NOT EXISTS usage_sessions_login_time_idx ON public.usage_sessions (login_time);
+
+-- @@
+CREATE INDEX IF NOT EXISTS usage_sessions_last_event_idx ON public.usage_sessions (last_event_time);
+
+-- @@
+-- One row per home_tabset navigation. v_time_on_tab reads it.
+CREATE TABLE IF NOT EXISTS public.usage_tab_visits (
+    session     text      NOT NULL,
+    entered_at  timestamp NOT NULL,
+    tab         text,
+    left_at     timestamp,
+    seconds     numeric
+);
+
+-- @@
+CREATE INDEX IF NOT EXISTS usage_tab_visits_entered_idx ON public.usage_tab_visits (entered_at);
+
+-- @@
+CREATE INDEX IF NOT EXISTS usage_tab_visits_session_idx ON public.usage_tab_visits (session);
+
+-- @@
+-- Recompute the rollup rows for the given sessions (idempotent).
+CREATE OR REPLACE FUNCTION public.usage_refresh_sessions(p_sessions text[]) RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE n integer;
+BEGIN
+  WITH ev AS (
+    SELECT e.session, e."time", e.type, e.app_name,
+           CASE WHEN e.type IN ('login','session_context','browser','navigation')
+                     AND pg_input_is_valid(e.details, 'jsonb') THEN e.details::jsonb END AS j
+    FROM public.event_log e
+    WHERE e.session = ANY (p_sessions)
+  ), x AS (
+    SELECT session,
+      min("time") FILTER (WHERE type = 'login')  AS login_time,
+      max("time") FILTER (WHERE type = 'logout') AS logout_time,
+      (array_agg(app_name ORDER BY "time"))[1]   AS first_app_name,
+      (array_agg(public.ev_jtext(j,'username')    ORDER BY "time") FILTER (WHERE type = 'login'))[1]           AS username,
+      (array_agg(public.ev_jtext(j,'environment') ORDER BY "time") FILTER (WHERE type = 'session_context'))[1] AS ctx_environment,
+      (array_agg(public.ev_jtext(j,'app_version') ORDER BY "time") FILTER (WHERE type = 'session_context'))[1] AS ctx_app_version,
+      (array_agg(public.ev_jtext(j,'pod')         ORDER BY "time") FILTER (WHERE type = 'session_context'))[1] AS ctx_pod,
+      (array_agg(public.ev_jtext(j,'user_id')     ORDER BY "time") FILTER (WHERE type = 'session_context'))[1] AS user_id,
+      (array_agg(public.ev_jtext(j,'org_id')      ORDER BY "time") FILTER (WHERE type = 'session_context'))[1] AS org_id,
+      (array_agg(public.ev_jtext(j,'value')       ORDER BY "time") FILTER (WHERE type = 'browser'))[1]         AS browser,
+      count(*) AS n_events,
+      count(*) FILTER (WHERE type = 'error') AS n_errors,
+      (array_agg(public.ev_jtext(j,'value') ORDER BY "time")      FILTER (WHERE type = 'navigation' AND public.ev_jtext(j,'id') = 'home_tabset'))[1] AS first_tab,
+      (array_agg(public.ev_jtext(j,'value') ORDER BY "time" DESC) FILTER (WHERE type = 'navigation' AND public.ev_jtext(j,'id') = 'home_tabset'))[1] AS last_tab,
+      max("time") AS last_event_time
+    FROM ev GROUP BY session
+  ), up AS (
+    INSERT INTO public.usage_sessions AS u
+      (session, login_time, logout_time, duration_s, username, environment, app_version, pod,
+       user_id, org_id, browser, n_events, n_errors, first_tab, last_tab, last_event_time, refreshed_at)
+    SELECT x.session, x.login_time, x.logout_time,
+           EXTRACT(EPOCH FROM (x.logout_time - x.login_time)),
+           x.username,
+           COALESCE(p.environment, x.ctx_environment),
+           COALESCE(p.app_version, x.ctx_app_version),
+           COALESCE(p.pod, x.ctx_pod),
+           x.user_id, x.org_id, x.browser, x.n_events, x.n_errors, x.first_tab, x.last_tab,
+           x.last_event_time, now()
+    FROM x, LATERAL public.usage_parse_app_name(x.first_app_name) p
+    ON CONFLICT (session) DO UPDATE SET
+      login_time = EXCLUDED.login_time, logout_time = EXCLUDED.logout_time, duration_s = EXCLUDED.duration_s,
+      username = EXCLUDED.username, environment = EXCLUDED.environment, app_version = EXCLUDED.app_version,
+      pod = EXCLUDED.pod, user_id = EXCLUDED.user_id, org_id = EXCLUDED.org_id, browser = EXCLUDED.browser,
+      n_events = EXCLUDED.n_events, n_errors = EXCLUDED.n_errors, first_tab = EXCLUDED.first_tab,
+      last_tab = EXCLUDED.last_tab, last_event_time = EXCLUDED.last_event_time, refreshed_at = now()
+    RETURNING 1
+  ), del AS (
+    DELETE FROM public.usage_tab_visits WHERE session = ANY (p_sessions) RETURNING 1
+  ), nav AS (
+    SELECT ev.session, ev."time" AS entered_at, public.ev_jtext(ev.j,'value') AS tab
+    FROM ev WHERE ev.type = 'navigation' AND public.ev_jtext(ev.j,'id') = 'home_tabset'
+  ), v AS (
+    SELECT nav.session, nav.tab, nav.entered_at,
+           LEAD(nav.entered_at) OVER (PARTITION BY nav.session ORDER BY nav.entered_at) AS next_at,
+           x.logout_time
+    FROM nav JOIN x ON x.session = nav.session
+  ), ins AS (
+    INSERT INTO public.usage_tab_visits (session, entered_at, tab, left_at, seconds)
+    SELECT session, entered_at, tab, COALESCE(next_at, logout_time),
+           EXTRACT(EPOCH FROM (COALESCE(next_at, logout_time) - entered_at))
+    FROM v RETURNING 1
+  )
+  SELECT count(*) INTO n FROM up;
+  RETURN n;
+END $$;
+
+-- @@
+-- Backfill / reconcile: every session with an event in [p_from, p_to), 2000 per batch.
+CREATE OR REPLACE FUNCTION public.usage_refresh_range(p_from timestamp, p_to timestamp DEFAULT 'infinity') RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE s text[]; b text[]; n integer := 0; i integer;
+BEGIN
+  SELECT array_agg(DISTINCT session) INTO s
+  FROM public.event_log WHERE "time" >= p_from AND "time" < p_to AND session IS NOT NULL;
+  IF s IS NULL THEN RETURN 0; END IF;
+  FOR i IN 1 .. array_length(s, 1) BY 2000 LOOP
+    n := n + public.usage_refresh_sessions(s[i : i + 1999]);
+  END LOOP;
+  RETURN n;
+END $$;
+
+-- @@
+-- Incremental refresh: sessions with events since (newest rolled-up event - lookback).
+-- Returns -1 when another refresh holds the lock.
+CREATE OR REPLACE FUNCTION public.usage_refresh(p_lookback interval DEFAULT interval '2 hours') RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE wm timestamp; n integer;
+BEGIN
+  IF NOT pg_try_advisory_xact_lock(7311427001) THEN RETURN -1; END IF;
+  -- LEAST(): a future-dated event must not move the watermark past real traffic.
+  SELECT LEAST(max(last_event_time), (now() AT TIME ZONE 'UTC')) - p_lookback INTO wm FROM public.usage_sessions;
+  RETURN public.usage_refresh_range(COALESCE(wm, '-infinity'));
+END $$;
+
+-- =============================================================================
 -- v_sessions -- one row per session token
 -- =============================================================================
 -- environment/app_version/pod come from app_name on every row; session_context
@@ -245,103 +420,110 @@ FROM public.event_log e;
 
 -- @@
 CREATE OR REPLACE VIEW public.v_sessions AS
-WITH sess AS (
-    SELECT DISTINCT session
-    FROM public.event_log
-    WHERE session IS NOT NULL
-),
-login_ev AS (
-    SELECT DISTINCT ON (session)
-        session, "time" AS login_time, ev_text(details, 'username') AS username
-    FROM public.event_log
-    WHERE type = 'login'
-    ORDER BY session, "time" ASC
-),
-logout_ev AS (
-    SELECT DISTINCT ON (session)
-        session, "time" AS logout_time
-    FROM public.event_log
-    WHERE type = 'logout'
-    ORDER BY session, "time" DESC
-),
-ctx_ev AS (
-    SELECT DISTINCT ON (session)
-        session,
-        ev_text(details, 'environment') AS ctx_environment,
-        ev_text(details, 'app_version') AS ctx_app_version,
-        ev_text(details, 'pod') AS ctx_pod,
-        ev_text(details, 'user_id') AS ctx_user_id,
-        ev_text(details, 'org_id') AS ctx_org_id
-    FROM public.event_log
-    WHERE type = 'session_context'
-    ORDER BY session, "time" ASC
-),
-appname_ev AS (
-    SELECT DISTINCT ON (session)
-        session,
-        app_name,
-        environment AS parsed_environment,
-        app_version AS parsed_app_version,
-        pod AS parsed_pod
-    FROM public.v_events
-    WHERE session IS NOT NULL
-    ORDER BY session, "time" ASC
-),
-browser_ev AS (
-    SELECT DISTINCT ON (session)
-        session, ev_text(details, 'value') AS browser
-    FROM public.event_log
-    WHERE type = 'browser'
-    ORDER BY session, "time" ASC
-),
-counts_ev AS (
-    SELECT
-        session,
-        count(*) AS n_events,
-        count(*) FILTER (WHERE type = 'error') AS n_errors
-    FROM public.event_log
-    WHERE session IS NOT NULL
-    GROUP BY session
-),
-first_tab_ev AS (
-    SELECT DISTINCT ON (session)
-        session, ev_text(details, 'value') AS first_tab
-    FROM public.event_log
-    WHERE type = 'navigation' AND ev_text(details, 'id') = 'home_tabset'
-    ORDER BY session, "time" ASC
-),
-last_tab_ev AS (
-    SELECT DISTINCT ON (session)
-        session, ev_text(details, 'value') AS last_tab
-    FROM public.event_log
-    WHERE type = 'navigation' AND ev_text(details, 'id') = 'home_tabset'
-    ORDER BY session, "time" DESC
-)
-SELECT
-    s.session,
-    l.login_time,
-    lo.logout_time,
-    EXTRACT(EPOCH FROM (lo.logout_time - l.login_time)) AS duration_s,
-    l.username,
-    COALESCE(a.parsed_environment, c.ctx_environment) AS environment,
-    COALESCE(a.parsed_app_version, c.ctx_app_version) AS app_version,
-    COALESCE(a.parsed_pod, c.ctx_pod) AS pod,
-    c.ctx_user_id AS user_id,
-    c.ctx_org_id AS org_id,
-    b.browser,
-    COALESCE(cnt.n_events, 0) AS n_events,
-    COALESCE(cnt.n_errors, 0) AS n_errors,
-    ft.first_tab,
-    lt.last_tab
-FROM sess s
-LEFT JOIN login_ev     l   ON l.session = s.session
-LEFT JOIN logout_ev    lo  ON lo.session = s.session
-LEFT JOIN ctx_ev       c   ON c.session = s.session
-LEFT JOIN appname_ev   a   ON a.session = s.session
-LEFT JOIN browser_ev   b   ON b.session = s.session
-LEFT JOIN counts_ev    cnt ON cnt.session = s.session
-LEFT JOIN first_tab_ev ft  ON ft.session = s.session
-LEFT JOIN last_tab_ev  lt  ON lt.session = s.session;
+SELECT session, login_time, logout_time, duration_s, username, environment, app_version, pod,
+       user_id, org_id, browser, n_events, n_errors, first_tab, last_tab
+FROM public.usage_sessions;
+
+-- ROLLBACK (legacy definition, full scan of event_log per query). To restore,
+-- uncomment and run it in psql:
+-- CREATE OR REPLACE VIEW public.v_sessions AS
+-- WITH sess AS (
+--     SELECT DISTINCT session
+--     FROM public.event_log
+--     WHERE session IS NOT NULL
+-- ),
+-- login_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session, "time" AS login_time, ev_text(details, 'username') AS username
+--     FROM public.event_log
+--     WHERE type = 'login'
+--     ORDER BY session, "time" ASC
+-- ),
+-- logout_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session, "time" AS logout_time
+--     FROM public.event_log
+--     WHERE type = 'logout'
+--     ORDER BY session, "time" DESC
+-- ),
+-- ctx_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session,
+--         ev_text(details, 'environment') AS ctx_environment,
+--         ev_text(details, 'app_version') AS ctx_app_version,
+--         ev_text(details, 'pod') AS ctx_pod,
+--         ev_text(details, 'user_id') AS ctx_user_id,
+--         ev_text(details, 'org_id') AS ctx_org_id
+--     FROM public.event_log
+--     WHERE type = 'session_context'
+--     ORDER BY session, "time" ASC
+-- ),
+-- appname_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session,
+--         app_name,
+--         environment AS parsed_environment,
+--         app_version AS parsed_app_version,
+--         pod AS parsed_pod
+--     FROM public.v_events
+--     WHERE session IS NOT NULL
+--     ORDER BY session, "time" ASC
+-- ),
+-- browser_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session, ev_text(details, 'value') AS browser
+--     FROM public.event_log
+--     WHERE type = 'browser'
+--     ORDER BY session, "time" ASC
+-- ),
+-- counts_ev AS (
+--     SELECT
+--         session,
+--         count(*) AS n_events,
+--         count(*) FILTER (WHERE type = 'error') AS n_errors
+--     FROM public.event_log
+--     WHERE session IS NOT NULL
+--     GROUP BY session
+-- ),
+-- first_tab_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session, ev_text(details, 'value') AS first_tab
+--     FROM public.event_log
+--     WHERE type = 'navigation' AND ev_text(details, 'id') = 'home_tabset'
+--     ORDER BY session, "time" ASC
+-- ),
+-- last_tab_ev AS (
+--     SELECT DISTINCT ON (session)
+--         session, ev_text(details, 'value') AS last_tab
+--     FROM public.event_log
+--     WHERE type = 'navigation' AND ev_text(details, 'id') = 'home_tabset'
+--     ORDER BY session, "time" DESC
+-- )
+-- SELECT
+--     s.session,
+--     l.login_time,
+--     lo.logout_time,
+--     EXTRACT(EPOCH FROM (lo.logout_time - l.login_time)) AS duration_s,
+--     l.username,
+--     COALESCE(a.parsed_environment, c.ctx_environment) AS environment,
+--     COALESCE(a.parsed_app_version, c.ctx_app_version) AS app_version,
+--     COALESCE(a.parsed_pod, c.ctx_pod) AS pod,
+--     c.ctx_user_id AS user_id,
+--     c.ctx_org_id AS org_id,
+--     b.browser,
+--     COALESCE(cnt.n_events, 0) AS n_events,
+--     COALESCE(cnt.n_errors, 0) AS n_errors,
+--     ft.first_tab,
+--     lt.last_tab
+-- FROM sess s
+-- LEFT JOIN login_ev     l   ON l.session = s.session
+-- LEFT JOIN logout_ev    lo  ON lo.session = s.session
+-- LEFT JOIN ctx_ev       c   ON c.session = s.session
+-- LEFT JOIN appname_ev   a   ON a.session = s.session
+-- LEFT JOIN browser_ev   b   ON b.session = s.session
+-- LEFT JOIN counts_ev    cnt ON cnt.session = s.session
+-- LEFT JOIN first_tab_ev ft  ON ft.session = s.session
+-- LEFT JOIN last_tab_ev  lt  ON lt.session = s.session;
 
 -- =============================================================================
 -- Typed projections -- one view per domain event, joined to v_sessions
@@ -613,30 +795,35 @@ WHERE e.type IN (
 
 -- @@
 CREATE OR REPLACE VIEW public.v_time_on_tab AS
-WITH nav AS (
-    SELECT
-        e.session,
-        e."time" AS entered_at,
-        ev_text(e.details, 'value') AS tab
-    FROM public.event_log e
-    WHERE e.type = 'navigation' AND ev_text(e.details, 'id') = 'home_tabset'
-)
-SELECT
-    n.session,
-    n.tab,
-    n.entered_at,
-    COALESCE(
-        LEAD(n.entered_at) OVER (PARTITION BY n.session ORDER BY n.entered_at),
-        s.logout_time
-    ) AS left_at,
-    EXTRACT(EPOCH FROM (
-        COALESCE(
-            LEAD(n.entered_at) OVER (PARTITION BY n.session ORDER BY n.entered_at),
-            s.logout_time
-        ) - n.entered_at
-    )) AS seconds
-FROM nav n
-JOIN public.v_sessions s ON s.session = n.session;
+SELECT session, tab, entered_at, left_at, seconds
+FROM public.usage_tab_visits;
+
+-- ROLLBACK (legacy definition). To restore, uncomment and run it in psql:
+-- CREATE OR REPLACE VIEW public.v_time_on_tab AS
+-- WITH nav AS (
+--     SELECT
+--         e.session,
+--         e."time" AS entered_at,
+--         ev_text(e.details, 'value') AS tab
+--     FROM public.event_log e
+--     WHERE e.type = 'navigation' AND ev_text(e.details, 'id') = 'home_tabset'
+-- )
+-- SELECT
+--     n.session,
+--     n.tab,
+--     n.entered_at,
+--     COALESCE(
+--         LEAD(n.entered_at) OVER (PARTITION BY n.session ORDER BY n.entered_at),
+--         s.logout_time
+--     ) AS left_at,
+--     EXTRACT(EPOCH FROM (
+--         COALESCE(
+--             LEAD(n.entered_at) OVER (PARTITION BY n.session ORDER BY n.entered_at),
+--             s.logout_time
+--         ) - n.entered_at
+--     )) AS seconds
+-- FROM nav n
+-- JOIN public.v_sessions s ON s.session = n.session;
 
 -- =============================================================================
 -- v_daily_active -- daily active users/sessions/orgs

@@ -102,3 +102,42 @@ usage_views_present <- function(data_storage) {
 
   !is.null(result) && nrow(result) > 0
 }
+
+#' Refresh the usage rollup tables if they are installed and backfilled
+#'
+#' @description
+#' Runs `usage_refresh()` and returns the newest `usage_sessions.refreshed_at`.
+#' Returns `NULL` (and does nothing) while the rollup is not installed, or
+#' while `usage_sessions` is empty: the first refresh is the full backfill,
+#' which belongs in an admin `psql` session, not under the dashboard's
+#' statement timeout.
+#'
+#' @param data_storage a [`DataStorageSQLFamily`] instance.
+#'
+#' @return A `POSIXct` scalar, or `NULL`.
+#' @keywords internal
+#' @noRd
+usage_refresh_if_ready <- function(data_storage) {
+  tryCatch(
+    {
+      installed <- data_storage$query(paste(
+        "SELECT to_regclass('public.usage_sessions') IS NOT NULL",
+        "AND to_regprocedure('public.usage_refresh(interval)') IS NOT NULL AS ok"
+      ))$ok
+      if (!isTRUE(installed)) {
+        return(NULL)
+      }
+      if (nrow(data_storage$query("SELECT 1 FROM public.usage_sessions LIMIT 1")) == 0) {
+        return(NULL)
+      }
+      data_storage$query("SELECT public.usage_refresh()")
+      data_storage$query("SELECT max(refreshed_at) AS at FROM public.usage_sessions")$at
+    },
+    error = function(e) {
+      logger::log_warn(
+        "usage rollup refresh failed: {conditionMessage(e)}", namespace = "shiny.telemetry"
+      )
+      NULL
+    }
+  )
+}

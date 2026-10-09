@@ -50,13 +50,10 @@ prepare_color_scale <- function(values, palette) {
 }
 
 prepare_date_axis_ticks <- function(date_sequence, quantile = 0.1) {
-  lct <- Sys.getlocale("LC_TIME")
-  Sys.setlocale("LC_TIME", "en_US.UTF-8")
   date_range <- sort(date_sequence)
   n <- length(date_range)
   tickvals <- date_range[unique(c(seq(1, n, by = max(1, floor(quantile * n))), n))]
   ticktext <- c(format(tickvals[1], "%b %d<br />%Y"), format(tickvals[-1], "%b %d"))
-  Sys.setlocale("LC_TIME", lct)
   list(tickvals = tickvals, ticktext = ticktext)
 }
 
