@@ -28,6 +28,7 @@ Imports:
     htmltools,
     httr2,
     jsonlite,
+    later,
     lifecycle,
     logger,
     lubridate,

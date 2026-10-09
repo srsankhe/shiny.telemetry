@@ -216,13 +216,82 @@ product_usage_server <- function(input, output, session, data_storage) {
     if (identical(input$usage_environment, "All")) NULL else input$usage_environment
   })
 
-  # One reactive per metric function: shares the date window + environment
-  # filter every query needs.
-  # Brings the rollup tables up to date once per date/environment change.
-  refreshed_at <- shiny::reactive({
-    shiny::req(input$date_from, input$date_to, input$usage_environment)
-    usage_refresh_if_ready(data_storage)
+  # Query queue. The 25 metric queries run one per tick, in page order. Each
+  # tick is its own reactive flush, so an output reaches the browser as soon as
+  # its own query is done instead of after all 25. The queue starts only while
+  # the tab is open and the window (dates, environment) has changed; returning
+  # to the tab reuses the loaded results. req() on the environment: its
+  # renderUI flips NULL -> "All" after the first flush.
+  pu_queue <- list(
+    overview_data = pu_overview_totals,
+    daily_active_data = pu_daily_active,
+    users_per_org_data = pu_users_per_org,
+    recent_sessions_data = pu_recent_sessions,
+    retention_data = pu_weekly_retention,
+    feature_adoption_data = pu_feature_adoption,
+    model_type_data = pu_model_type_mix,
+    export_format_data = pu_export_format_mix,
+    analysis_export_rate_data = pu_analysis_export_rate,
+    download_mix_data = pu_download_mix,
+    feature_error_rate_data = pu_feature_error_rate,
+    model_duration_data = pu_model_duration_by_target_bucket,
+    model_complexity_data = pu_model_complexity,
+    qc_exclusion_data = pu_qc_exclusion_rate,
+    time_to_first_model_data = pu_time_to_first_model,
+    session_length_data = pu_session_length_by_env,
+    weekday_hour_data = pu_sessions_by_weekday_hour,
+    time_per_tab_data = pu_time_per_tab,
+    tab_first_last_data = pu_tab_first_last,
+    heatmap_duration_data = pu_heatmap_duration_by_sample_bucket,
+    pathway_duration_data = pu_pathway_duration_by_database,
+    tour_completion_data = pu_tour_completion_rate,
+    tab_funnel_data = pu_tab_funnel,
+    analysis_funnel_data = pu_analysis_funnel,
+    tour_funnel_data = pu_tour_funnel
+  )
+  results <- lapply(pu_queue, function(fn) shiny::reactiveVal())
+  refreshed_at <- shiny::reactiveVal()
+  queue <- shiny::reactiveValues(job = NULL, pos = 0L)
+
+  shiny::observe({
+    shiny::req(
+      identical(input$uisidebar, "product_usage"),
+      input$date_from, input$date_to, input$usage_environment
+    )
+    job <- list(from = input$date_from, to = input$date_to, env = env())
+    shiny::isolate({
+      if (identical(job, queue$job)) return()
+      for (r in results) r(NULL)
+      refreshed_at(usage_refresh_if_ready(data_storage))
+      queue$job <- job
+      queue$pos <- 0L  # 0 then 1: re-fires the stepper even if pos was already 1
+      queue$pos <- 1L
+    })
   })
+
+  shiny::observe({
+    pos <- queue$pos
+    shiny::req(pos >= 1L, pos <= length(pu_queue))
+    job <- shiny::isolate(queue$job)
+    name <- names(pu_queue)[[pos]]
+    res <- safe_pu_query(pu_queue[[name]], data_storage, job$from, job$to, job$env)
+    shiny::isolate({
+      if (!identical(job, queue$job)) return()  # window changed mid-query
+      results[[name]](res)
+    })
+    # Next query after this flush is sent, not in the same flush cycle.
+    later::later(function() {
+      if (identical(job, shiny::isolate(queue$job))) queue$pos <- pos + 1L
+    }, 0.05)
+  })
+
+  usage_result <- function(name) {
+    shiny::reactive({
+      res <- results[[name]]()
+      shiny::validate(shiny::need(!is.null(res), "Loading..."))
+      res
+    })
+  }
 
   output$usage_status <- shiny::renderUI({
     at <- refreshed_at()
@@ -230,48 +299,31 @@ product_usage_server <- function(input, output, session, data_storage) {
     shiny::tags$p(class = "ui small grey text", paste("Data refreshed:", format(at, "%Y-%m-%d %H:%M UTC")))
   })
 
-  # req() on the environment: its renderUI flips NULL -> "All" after the first
-  # flush, which would otherwise run every query twice.
-  usage_reactive <- function(fn) {
-    shiny::reactive({
-      shiny::req(input$date_from, input$date_to, input$usage_environment)
-      refreshed_at()
-      safe_pu_query(fn, data_storage, input$date_from, input$date_to, env())
-    })
-  }
-
-  overview_data <- usage_reactive(pu_overview_totals)
-
-  daily_active_data <- usage_reactive(pu_daily_active)
-  users_per_org_data <- usage_reactive(pu_users_per_org)
-  recent_sessions_data <- usage_reactive(pu_recent_sessions)
-  retention_data <- usage_reactive(pu_weekly_retention)
-
-  feature_adoption_data <- usage_reactive(pu_feature_adoption)
-  model_type_data <- usage_reactive(pu_model_type_mix)
-  export_format_data <- usage_reactive(pu_export_format_mix)
-  analysis_export_rate_data <- usage_reactive(pu_analysis_export_rate)
-  download_mix_data <- usage_reactive(pu_download_mix)
-
-  feature_error_rate_data <- usage_reactive(pu_feature_error_rate)
-  model_duration_data <- usage_reactive(pu_model_duration_by_target_bucket)
-  model_complexity_data <- usage_reactive(pu_model_complexity)
-  qc_exclusion_data <- usage_reactive(pu_qc_exclusion_rate)
-
-  time_to_first_model_data <- usage_reactive(pu_time_to_first_model)
-  session_length_data <- usage_reactive(pu_session_length_by_env)
-  weekday_hour_data <- usage_reactive(pu_sessions_by_weekday_hour)
-
-  time_per_tab_data <- usage_reactive(pu_time_per_tab)
-  tab_first_last_data <- usage_reactive(pu_tab_first_last)
-
-  heatmap_duration_data <- usage_reactive(pu_heatmap_duration_by_sample_bucket)
-  pathway_duration_data <- usage_reactive(pu_pathway_duration_by_database)
-  tour_completion_data <- usage_reactive(pu_tour_completion_rate)
-
-  tab_funnel_data <- usage_reactive(pu_tab_funnel)
-  analysis_funnel_data <- usage_reactive(pu_analysis_funnel)
-  tour_funnel_data <- usage_reactive(pu_tour_funnel)
+  overview_data <- usage_result("overview_data")
+  daily_active_data <- usage_result("daily_active_data")
+  users_per_org_data <- usage_result("users_per_org_data")
+  recent_sessions_data <- usage_result("recent_sessions_data")
+  retention_data <- usage_result("retention_data")
+  feature_adoption_data <- usage_result("feature_adoption_data")
+  model_type_data <- usage_result("model_type_data")
+  export_format_data <- usage_result("export_format_data")
+  analysis_export_rate_data <- usage_result("analysis_export_rate_data")
+  download_mix_data <- usage_result("download_mix_data")
+  feature_error_rate_data <- usage_result("feature_error_rate_data")
+  model_duration_data <- usage_result("model_duration_data")
+  model_complexity_data <- usage_result("model_complexity_data")
+  qc_exclusion_data <- usage_result("qc_exclusion_data")
+  time_to_first_model_data <- usage_result("time_to_first_model_data")
+  session_length_data <- usage_result("session_length_data")
+  weekday_hour_data <- usage_result("weekday_hour_data")
+  time_per_tab_data <- usage_result("time_per_tab_data")
+  tab_first_last_data <- usage_result("tab_first_last_data")
+  heatmap_duration_data <- usage_result("heatmap_duration_data")
+  pathway_duration_data <- usage_result("pathway_duration_data")
+  tour_completion_data <- usage_result("tour_completion_data")
+  tab_funnel_data <- usage_result("tab_funnel_data")
+  analysis_funnel_data <- usage_result("analysis_funnel_data")
+  tour_funnel_data <- usage_result("tour_funnel_data")
 
   # -- Overview value boxes -------------------------------------------------
 
