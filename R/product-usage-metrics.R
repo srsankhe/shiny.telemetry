@@ -22,9 +22,9 @@ pu_row <- function(output_id, group, title, what, value, method, caveats = "", q
 #'
 #' @description
 #' One row per output id in `product_usage_ui()`/`product_usage_server()`
-#' (32 rows total: 23 plots/tables/text metrics, 6 value boxes, the
-#' environment picker, the CSV download button and the views-status
-#' message). Backs both the hover text built by [`pu_hover()`] and the
+#' (34 rows total: 24 plots/tables/text metrics, 6 value boxes, the
+#' environment picker, the "Include Alamar users" toggle, the CSV download
+#' button and the views-status message). Backs both the hover text built by [`pu_hover()`] and the
 #' tables in [`product_usage_methods_ui()`].
 #'
 #' @return A [`dplyr::tibble()`] with columns `output_id`, `group`, `title`,
@@ -56,6 +56,28 @@ pu_metric_catalog <- function() {
       caveats = paste(
         "Legacy rows written before the app_name format change have NULL environment and are",
         "excluded from this list entirely. Selecting All is the only way to include them."
+      )
+    ),
+    pu_row(
+      "usage_include_internal", "Overview", "Include Alamar users",
+      "A toggle, on by default, that keeps or drops sessions from Alamar staff accounts.",
+      paste(
+        "Customer-facing numbers should not count Alamar staff exploring the app. Switching",
+        "the toggle off shows what customers alone did. Automation (Cypress) accounts are",
+        "never counted, whatever the toggle says."
+      ),
+      paste(
+        "Every v_* view carries user_class, computed per session by usage_user_class(username)",
+        "from the regex rules in usage_user_rules: 'automation' for plus-addressed +test",
+        "accounts (name+test@, name+tester@, name+test_01@ ...), 'internal' for any other",
+        "@alamarbio.com address, 'external' otherwise, 'unknown' when the session has no login",
+        "row. Every pu_* query adds",
+        "user_class <> 'automation' AND ($4 OR user_class <> 'internal'), where $4 is this toggle."
+      ),
+      caveats = paste(
+        "Rules live in the usage_user_rules table, not in code: edit them with UPDATE / INSERT",
+        "in psql and the next query picks them up. The seed is only inserted when the pattern is",
+        "absent, so re-applying the schema does not undo an edit."
       )
     ),
     pu_row(
@@ -143,9 +165,10 @@ pu_metric_catalog <- function() {
       "Line plot of daily session counts, one line per environment.",
       "Shows the day-to-day usage trend and whether it differs by environment.",
       paste(
-        "pu_daily_active reads v_daily_active (one row per date x environment, built by grouping",
-        "v_sessions by day), filtered to the selected date range and environment, plotting date",
-        "vs n_sessions colored by environment."
+        "pu_daily_active groups v_sessions by login day x environment, counting distinct",
+        "usernames, sessions and org_ids, filtered to the selected date range, environment and",
+        "user class, plotting date vs n_sessions colored by environment. It does not read",
+        "v_daily_active, which pre-aggregates before the user-class filter can apply."
       ),
       caveats = "environment is NULL on legacy sessions written before the app_name format change; those show as their own blank-colored series.",
       question = "Q3"
