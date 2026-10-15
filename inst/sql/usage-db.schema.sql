@@ -420,8 +420,10 @@ END $$;
 -- NOTHING, so a re-apply never overwrites an edited rule; change or add rules
 -- with plain UPDATE / INSERT in psql.
 --   automation : plus-addressed Alamar test accounts (name+test@,
---                name+tester@, name+test_01@ ...). The dashboard queries never
---                count these.
+--                name+tester@, name+test_01@ ...). v_sessions drops these
+--                rows, and every typed view inner-joins v_sessions, so no v_*
+--                view except v_events ever shows them. For a raw look at an
+--                automation session, query usage_sessions or event_log.
 --   internal   : any other @alamarbio.com account. The dashboard's "Include
 --                Alamar users" toggle keeps or drops these.
 -- v_sessions classifies on read, so a rule edit takes effect on the next
@@ -457,9 +459,11 @@ LANGUAGE sql STABLE PARALLEL SAFE AS $$
 $$;
 
 -- =============================================================================
--- v_sessions -- one row per session token
+-- v_sessions -- one row per session token, automation sessions excluded
 -- =============================================================================
--- user_class is computed per row from usage_user_rules (see USER CLASS above).
+-- user_class is computed per row from usage_user_rules (see USER CLASS above);
+-- rows classed 'automation' are filtered out here, which also removes them
+-- from every typed view below (they all inner-join v_sessions).
 -- environment/app_version/pod come from app_name on every row; session_context
 -- is the fallback (and the only source of user_id/org_id). Old rows without
 -- environment/version stay NULL for those two columns; pod is still parsed.)
@@ -469,9 +473,12 @@ $$;
 -- @@
 CREATE OR REPLACE VIEW public.v_sessions AS
 SELECT session, login_time, logout_time, duration_s, username, environment, app_version, pod,
-       user_id, org_id, browser, n_events, n_errors, first_tab, last_tab,
-       public.usage_user_class(username) AS user_class
-FROM public.usage_sessions;
+       user_id, org_id, browser, n_events, n_errors, first_tab, last_tab, user_class
+FROM (
+    SELECT u.*, public.usage_user_class(u.username) AS user_class
+    FROM public.usage_sessions u
+) s
+WHERE s.user_class <> 'automation';
 
 -- ROLLBACK (legacy definition, full scan of event_log per query). To restore,
 -- uncomment and run it in psql:
@@ -878,7 +885,8 @@ FROM public.usage_tab_visits;
 -- v_daily_active -- daily active users/sessions/orgs
 -- =============================================================================
 -- One row per date x environment x user_class, so a reader can drop
--- automation / internal rows before summing. n_users and n_sessions sum
+-- automation / internal rows before summing. user_class is the last column:
+-- CREATE OR REPLACE VIEW can only append columns, never reorder them. n_users and n_sessions sum
 -- cleanly across user_class (a username has exactly one class); n_orgs does
 -- not (an org can hold users of more than one class), so sum n_orgs only
 -- within one class, or count from v_sessions directly as pu_daily_active does.
@@ -891,10 +899,10 @@ CREATE OR REPLACE VIEW public.v_daily_active AS
 SELECT
     date_trunc('day', login_time)::date AS date,
     environment,
-    user_class,
     count(DISTINCT username) AS n_users,
     count(DISTINCT session) AS n_sessions,
-    count(DISTINCT org_id) AS n_orgs
+    count(DISTINCT org_id) AS n_orgs,
+    user_class
 FROM public.v_sessions
 WHERE login_time IS NOT NULL
-GROUP BY 1, 2, 3;
+GROUP BY 1, 2, 6;

@@ -67,12 +67,13 @@ pu_metric_catalog <- function() {
         "never counted, whatever the toggle says."
       ),
       paste(
-        "Every v_* view carries user_class, computed per session by usage_user_class(username)",
-        "from the regex rules in usage_user_rules: 'automation' for plus-addressed +test",
-        "accounts (name+test@, name+tester@, name+test_01@ ...), 'internal' for any other",
-        "@alamarbio.com address, 'external' otherwise, 'unknown' when the session has no login",
-        "row. Every pu_* query adds",
-        "user_class <> 'automation' AND ($4 OR user_class <> 'internal'), where $4 is this toggle."
+        "v_sessions classifies each session with usage_user_class(username) from the regex",
+        "rules in usage_user_rules: 'automation' for plus-addressed +test accounts (name+test@,",
+        "name+tester@, name+test_01@ ...), 'internal' for any other @alamarbio.com address,",
+        "'external' otherwise, 'unknown' when the session has no login row. v_sessions drops",
+        "'automation' rows, and every typed v_* view inner-joins it, so automation never reaches",
+        "a query. Every pu_* query then adds ($4 OR user_class <> 'internal'), where $4 is this",
+        "toggle (plus a redundant user_class <> 'automation' guard)."
       ),
       caveats = paste(
         "Rules live in the usage_user_rules table, not in code: edit them with UPDATE / INSERT",
