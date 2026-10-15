@@ -6,8 +6,9 @@
 --   public.event_log(time, app_name, session, type, details) on Azure Postgres
 --   16. There is no primary key, no index, and `details` is TEXT holding JSON.
 --   This file adds read-side infrastructure only: indexes, JSON accessor
---   functions, and reporting views. It does not touch event_log's shape and
---   it does not change what NAS writes.
+--   functions, rollup tables, the user-class rules table, and reporting
+--   views. It does not touch event_log's shape and it does not change what
+--   NAS writes.
 --
 -- TWO JSON SHAPES IN `details` (both must parse correctly, forever)
 --   1. Legacy / built-in events (login, logout, navigation, input, error,
@@ -410,8 +411,55 @@ BEGIN
 END $$;
 
 -- =============================================================================
+-- USER CLASS -- who is behind a username: automation, internal, external
+-- =============================================================================
+-- Rules are data, not code. usage_user_class(username) returns the user_class
+-- of the lowest-priority matching rule, 'external' when no rule matches, and
+-- 'unknown' for a NULL username (a session with no login row). Patterns are
+-- case-insensitive POSIX regexes (~*). The seed below uses ON CONFLICT DO
+-- NOTHING, so a re-apply never overwrites an edited rule; change or add rules
+-- with plain UPDATE / INSERT in psql.
+--   automation : plus-addressed Alamar test accounts (name+test@,
+--                name+tester@, name+test_01@ ...). The dashboard queries never
+--                count these.
+--   internal   : any other @alamarbio.com account. The dashboard's "Include
+--                Alamar users" toggle keeps or drops these.
+-- v_sessions classifies on read, so a rule edit takes effect on the next
+-- query without a rollup refresh.
+
+-- @@
+CREATE TABLE IF NOT EXISTS public.usage_user_rules (
+    pattern    text PRIMARY KEY,
+    user_class text    NOT NULL CHECK (user_class IN ('automation', 'internal')),
+    priority   integer NOT NULL,
+    note       text
+);
+
+-- @@
+INSERT INTO public.usage_user_rules (pattern, user_class, priority, note) VALUES
+    ('\+test[^@]*@alamarbio\.com$', 'automation', 10, 'Cypress / automation accounts: local part contains +test'),
+    ('@alamarbio\.com$',             'internal',   20, 'Alamar staff')
+ON CONFLICT (pattern) DO NOTHING;
+
+-- @@
+CREATE OR REPLACE FUNCTION public.usage_user_class(username text) RETURNS text
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT CASE
+           WHEN username IS NULL THEN 'unknown'
+           ELSE COALESCE(
+             (SELECT r.user_class
+              FROM public.usage_user_rules r
+              WHERE username ~* r.pattern
+              ORDER BY r.priority, r.pattern
+              LIMIT 1),
+             'external')
+         END
+$$;
+
+-- =============================================================================
 -- v_sessions -- one row per session token
 -- =============================================================================
+-- user_class is computed per row from usage_user_rules (see USER CLASS above).
 -- environment/app_version/pod come from app_name on every row; session_context
 -- is the fallback (and the only source of user_id/org_id). Old rows without
 -- environment/version stay NULL for those two columns; pod is still parsed.)
@@ -421,7 +469,8 @@ END $$;
 -- @@
 CREATE OR REPLACE VIEW public.v_sessions AS
 SELECT session, login_time, logout_time, duration_s, username, environment, app_version, pod,
-       user_id, org_id, browser, n_events, n_errors, first_tab, last_tab
+       user_id, org_id, browser, n_events, n_errors, first_tab, last_tab,
+       public.usage_user_class(username) AS user_class
 FROM public.usage_sessions;
 
 -- ROLLBACK (legacy definition, full scan of event_log per query). To restore,
@@ -544,7 +593,7 @@ SELECT
     ev_int(e.details, 'duration_ms') AS duration_ms,
     ev_text(e.details, 'status') AS status,
     ev_text(e.details, 'error') AS error,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 WHERE e.type = 'analysis_opened';
@@ -569,7 +618,7 @@ SELECT
     ev_int(e.details, 'duration_ms') AS duration_ms,
     ev_text(e.details, 'status') AS status,
     ev_text(e.details, 'error') AS error,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -603,7 +652,7 @@ SELECT
     ev_text(e.details, 'status') AS status,
     ev_text(e.details, 'error') AS error,
     public.safe_jsonb(e.details) AS details_json,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -630,7 +679,7 @@ SELECT
     ev_int(e.details, 'duration_ms') AS duration_ms,
     ev_text(e.details, 'status') AS status,
     ev_text(e.details, 'error') AS error,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -655,7 +704,7 @@ SELECT
     ev_text(e.details, 'action') AS action,
     ev_int(e.details, 'n_excluded') AS n_excluded,
     ev_int(e.details, 'n_total') AS n_total,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -687,7 +736,7 @@ SELECT
     ev_int(e.details, 'duration_ms') AS duration_ms,
     ev_text(e.details, 'status') AS status,
     ev_text(e.details, 'error') AS error,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -708,7 +757,7 @@ SELECT
     e.session,
     la.analysis_id,
     ev_text(e.details, 'what') AS what,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -731,7 +780,7 @@ SELECT
     ev_text(e.details, 'tour') AS tour,
     ev_text(e.details, 'action') AS action,
     ev_int(e.details, 'step') AS step,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -767,7 +816,7 @@ SELECT
             THEN ev_text(e.details, 'analysis_id')
         ELSE la.analysis_id
     END AS analysis_id,
-    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id
+    s.username, s.environment, s.app_version, s.pod, s.user_id, s.org_id, s.user_class
 FROM public.event_log e
 JOIN public.v_sessions s ON s.session = e.session
 LEFT JOIN LATERAL (
@@ -828,6 +877,11 @@ FROM public.usage_tab_visits;
 -- =============================================================================
 -- v_daily_active -- daily active users/sessions/orgs
 -- =============================================================================
+-- One row per date x environment x user_class, so a reader can drop
+-- automation / internal rows before summing. n_users and n_sessions sum
+-- cleanly across user_class (a username has exactly one class); n_orgs does
+-- not (an org can hold users of more than one class), so sum n_orgs only
+-- within one class, or count from v_sessions directly as pu_daily_active does.
 -- environment is NULL for legacy rows (see header). n_orgs is NULL-safe
 -- (COUNT DISTINCT ignores NULL org_id, which is expected until
 -- session_context is flowing).
@@ -837,9 +891,10 @@ CREATE OR REPLACE VIEW public.v_daily_active AS
 SELECT
     date_trunc('day', login_time)::date AS date,
     environment,
+    user_class,
     count(DISTINCT username) AS n_users,
     count(DISTINCT session) AS n_sessions,
     count(DISTINCT org_id) AS n_orgs
 FROM public.v_sessions
 WHERE login_time IS NOT NULL
-GROUP BY 1, 2;
+GROUP BY 1, 2, 3;

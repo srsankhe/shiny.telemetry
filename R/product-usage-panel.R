@@ -1,8 +1,9 @@
 #' UI for the "Product usage" dashboard tab
 #'
 #' @description
-#' Body content for the `product_usage` tab: an environment picker and
-#' overview value-box row, a CSV download button, then one
+#' Body content for the `product_usage` tab: an environment picker, an
+#' "Include Alamar users" toggle, the overview value-box row, a CSV download
+#' button, then one
 #' `shiny.semantic::segment()` per question group (Who/What/How/When/Where/
 #' How long/Funnels). Every plot and table carries a heading with a
 #' [`pu_hover()`] info icon describing what it shows and why it matters;
@@ -23,6 +24,13 @@ product_usage_ui <- function() {
         class = "field",
         shiny::tags$label("Environment"),
         shiny::uiOutput("usage_environment_picker")
+      ),
+      shiny::div(
+        class = "field",
+        shiny.semantic::checkbox_input(
+          "usage_include_internal", "Include Alamar users", type = "toggle", is_marked = TRUE
+        ),
+        pu_hover("usage_include_internal")
       )
     ),
     shiny::div(
@@ -216,11 +224,16 @@ product_usage_server <- function(input, output, session, data_storage) {
     if (identical(input$usage_environment, "All")) NULL else input$usage_environment
   })
 
+  # TRUE until the toggle is switched off. Automation accounts are dropped by
+  # every query regardless; this only governs user_class = 'internal'.
+  include_internal <- shiny::reactive(!isFALSE(input$usage_include_internal))
+
   # Query queue. The 25 metric queries run one per tick, in page order. Each
   # tick is its own reactive flush, so an output reaches the browser as soon as
   # its own query is done instead of after all 25. The queue starts only while
-  # the tab is open and the window (dates, environment) has changed; returning
-  # to the tab reuses the loaded results. req() on the environment: its
+  # the tab is open and the window (dates, environment, Alamar toggle) has
+  # changed; returning to the tab reuses the loaded results. req() on the
+  # environment: its
   # renderUI flips NULL -> "All" after the first flush.
   pu_queue <- list(
     overview_data = pu_overview_totals,
@@ -258,7 +271,9 @@ product_usage_server <- function(input, output, session, data_storage) {
       identical(input$uisidebar, "product_usage"),
       input$date_from, input$date_to, input$usage_environment
     )
-    job <- list(from = input$date_from, to = input$date_to, env = env())
+    job <- list(
+      from = input$date_from, to = input$date_to, env = env(), internal = include_internal()
+    )
     shiny::isolate({
       if (identical(job, queue$job)) return()
       for (r in results) r(NULL)
@@ -274,7 +289,9 @@ product_usage_server <- function(input, output, session, data_storage) {
     shiny::req(pos >= 1L, pos <= length(pu_queue))
     job <- shiny::isolate(queue$job)
     name <- names(pu_queue)[[pos]]
-    res <- safe_pu_query(pu_queue[[name]], data_storage, job$from, job$to, job$env)
+    res <- safe_pu_query(
+      pu_queue[[name]], data_storage, job$from, job$to, job$env, job$internal
+    )
     shiny::isolate({
       if (!identical(job, queue$job)) return()  # window changed mid-query
       results[[name]](res)
@@ -628,7 +645,8 @@ product_usage_server <- function(input, output, session, data_storage) {
     content = function(file) {
       shiny::req(input$date_from, input$date_to)
       d <- safe_pu_query(
-        pu_feature_events_export, data_storage, input$date_from, input$date_to, env()
+        pu_feature_events_export, data_storage, input$date_from, input$date_to, env(),
+        include_internal()
       )
       utils::write.csv(d, file, row.names = FALSE)
     }

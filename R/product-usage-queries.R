@@ -1,16 +1,19 @@
 # Product-usage metric queries.
 #
 # One function per questions.md item, over the v_* views from ensure_usage_views().
-# Signature: (data_storage, date_from, date_to, environment = NULL); NULL = all.
+# Signature: (data_storage, date_from, date_to, environment = NULL, include_internal = TRUE);
+# environment NULL = all. Automation accounts (user_class = 'automation') are never
+# counted; include_internal = FALSE also drops Alamar staff (user_class = 'internal').
 
-#' Build the 3 positional params ($1 date_from, $2 date_to, $3 environment)
-#' shared by every product-usage query.
+#' Build the 4 positional params ($1 date_from, $2 date_to, $3 environment,
+#' $4 include_internal) shared by every product-usage query.
 #' @noRd
-pu_params <- function(date_from, date_to, environment = NULL) {
+pu_params <- function(date_from, date_to, environment = NULL, include_internal = TRUE) {
   list(
     as.character(date_from),
     as.character(date_to),
-    if (is.null(environment)) NA_character_ else environment
+    if (is.null(environment)) NA_character_ else environment,
+    isTRUE(include_internal)
   )
 }
 
@@ -20,7 +23,8 @@ pu_params <- function(date_from, date_to, environment = NULL) {
 #' session length, models run, exports.
 #' @keywords internal
 #' @noRd
-pu_overview_totals <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_overview_totals <- function(data_storage, date_from, date_to, environment = NULL,
+                               include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT
@@ -30,15 +34,20 @@ pu_overview_totals <- function(data_storage, date_from, date_to, environment = N
         percentile_cont(0.5) WITHIN GROUP (ORDER BY s.duration_s) AS median_session_s,
         (SELECT count(*) FROM v_model_runs m
            WHERE m."time" >= $1::date AND m."time" < ($2::date + 1)
-             AND ($3::text IS NULL OR m.environment = $3)) AS n_models,
+             AND ($3::text IS NULL OR m.environment = $3)
+             AND m.user_class <> 'automation'
+             AND ($4::boolean OR m.user_class <> 'internal')) AS n_models,
         (SELECT count(*) FROM v_exports x
            WHERE x."time" >= $1::date AND x."time" < ($2::date + 1)
-             AND ($3::text IS NULL OR x.environment = $3)) AS n_exports
+             AND ($3::text IS NULL OR x.environment = $3)
+             AND x.user_class <> 'automation'
+             AND ($4::boolean OR x.user_class <> 'internal')) AS n_exports
     FROM v_sessions s
     WHERE s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -46,41 +55,53 @@ pu_overview_totals <- function(data_storage, date_from, date_to, environment = N
 #' download button (not a numbered catalog question).
 #' @keywords internal
 #' @noRd
-pu_feature_events_export <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_feature_events_export <- function(data_storage, date_from, date_to, environment = NULL,
+                                     include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT *
     FROM v_feature_events s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     ORDER BY s."time"
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 # -- Who ----------------------------------------------------------------
 
-#' Q3: daily active users/sessions/orgs by environment
+#' Q3: daily active users/sessions/orgs by environment. Aggregates v_sessions
+#' directly (not v_daily_active) so the user-class filter applies before the
+#' DISTINCT counts.
 #' @keywords internal
 #' @noRd
-pu_daily_active <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_daily_active <- function(data_storage, date_from, date_to, environment = NULL,
+                            include_internal = TRUE) {
   data_storage$query(
     r"(
-    SELECT s.date, s.environment, s.n_users, s.n_sessions, s.n_orgs
-    FROM v_daily_active s
-    WHERE s.date >= $1::date AND s.date < ($2::date + 1)
+    SELECT date_trunc('day', s.login_time)::date AS date,
+           s.environment,
+           count(DISTINCT s.username) AS n_users,
+           count(DISTINCT s.session) AS n_sessions,
+           count(DISTINCT s.org_id) AS n_orgs
+    FROM v_sessions s
+    WHERE s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
+    GROUP BY 1, 2
     ORDER BY 1, 2
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q2: distinct users per org
 #' @keywords internal
 #' @noRd
-pu_users_per_org <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_users_per_org <- function(data_storage, date_from, date_to, environment = NULL,
+                             include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.org_id, count(DISTINCT s.user_id) AS n_users
@@ -88,35 +109,39 @@ pu_users_per_org <- function(data_storage, date_from, date_to, environment = NUL
     WHERE s.org_id IS NOT NULL
       AND s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 2 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Recent sessions with the pod id, for log lookup (not a catalog question)
 #' @keywords internal
 #' @noRd
-pu_recent_sessions <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_recent_sessions <- function(data_storage, date_from, date_to, environment = NULL,
+                               include_internal = TRUE) {
   data_storage$query(
     r"(
-    SELECT s.login_time, s.username, s.environment, s.app_version, s.pod,
+    SELECT s.login_time, s.username, s.user_class, s.environment, s.app_version, s.pod,
            round(s.duration_s / 60.0, 1) AS minutes, s.n_events, s.n_errors
     FROM v_sessions s
     WHERE s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     ORDER BY s.login_time DESC
     LIMIT 500
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q4: week-over-week retention
 #' @keywords internal
 #' @noRd
-pu_weekly_retention <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_weekly_retention <- function(data_storage, date_from, date_to, environment = NULL,
+                                include_internal = TRUE) {
   data_storage$query(
     r"(
     WITH weekly AS (
@@ -125,6 +150,7 @@ pu_weekly_retention <- function(data_storage, date_from, date_to, environment = 
         WHERE s.username IS NOT NULL
           AND s.login_time >= $1::date AND s.login_time < ($2::date + 1)
           AND ($3::text IS NULL OR s.environment = $3)
+          AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     )
     SELECT w1.week,
            count(DISTINCT w1.username) AS active_this_week,
@@ -135,7 +161,7 @@ pu_weekly_retention <- function(data_storage, date_from, date_to, environment = 
     GROUP BY 1
     ORDER BY 1
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -145,7 +171,8 @@ pu_weekly_retention <- function(data_storage, date_from, date_to, environment = 
 #' (generalises catalog Q5, which only checked model_run)
 #' @keywords internal
 #' @noRd
-pu_feature_adoption <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_feature_adoption <- function(data_storage, date_from, date_to, environment = NULL,
+                                include_internal = TRUE) {
   data_storage$query(
     r"(
     WITH sessions_in_window AS (
@@ -153,6 +180,7 @@ pu_feature_adoption <- function(data_storage, date_from, date_to, environment = 
         FROM v_sessions s
         WHERE s.login_time >= $1::date AND s.login_time < ($2::date + 1)
           AND ($3::text IS NULL OR s.environment = $3)
+          AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     ),
     feature_sessions AS (
         SELECT DISTINCT fe.session, fe.feature
@@ -170,48 +198,53 @@ pu_feature_adoption <- function(data_storage, date_from, date_to, environment = 
     GROUP BY 1
     ORDER BY 4 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q6: model type mix
 #' @keywords internal
 #' @noRd
-pu_model_type_mix <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_model_type_mix <- function(data_storage, date_from, date_to, environment = NULL,
+                              include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.model_type, count(*) AS n_runs
     FROM v_model_runs s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 2 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q7: export format mix
 #' @keywords internal
 #' @noRd
-pu_export_format_mix <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_export_format_mix <- function(data_storage, date_from, date_to, environment = NULL,
+                                 include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT fmt, count(*) AS n
     FROM v_exports s, unnest(s.formats) AS fmt
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 2 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q8: share of opened analyses that reach export
 #' @keywords internal
 #' @noRd
-pu_analysis_export_rate <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_analysis_export_rate <- function(data_storage, date_from, date_to, environment = NULL,
+                                    include_internal = TRUE) {
   data_storage$query(
     r"(
     WITH opened AS (
@@ -220,6 +253,7 @@ pu_analysis_export_rate <- function(data_storage, date_from, date_to, environmen
         WHERE s.analysis_id IS NOT NULL
           AND s."time" >= $1::date AND s."time" < ($2::date + 1)
           AND ($3::text IS NULL OR s.environment = $3)
+          AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     ),
     exported AS (
         SELECT DISTINCT s.analysis_id
@@ -227,6 +261,7 @@ pu_analysis_export_rate <- function(data_storage, date_from, date_to, environmen
         WHERE s.analysis_id IS NOT NULL
           AND s."time" >= $1::date AND s."time" < ($2::date + 1)
           AND ($3::text IS NULL OR s.environment = $3)
+          AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     )
     SELECT
         count(*) AS n_opened,
@@ -237,24 +272,26 @@ pu_analysis_export_rate <- function(data_storage, date_from, date_to, environmen
         ) AS pct_exported
     FROM opened o
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q11: most requested downloads
 #' @keywords internal
 #' @noRd
-pu_download_mix <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_download_mix <- function(data_storage, date_from, date_to, environment = NULL,
+                            include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.what, count(*) AS n
     FROM v_downloads s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 2 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -263,7 +300,8 @@ pu_download_mix <- function(data_storage, date_from, date_to, environment = NULL
 #' Q12: error rate per analytical feature
 #' @keywords internal
 #' @noRd
-pu_feature_error_rate <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_feature_error_rate <- function(data_storage, date_from, date_to, environment = NULL,
+                                  include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.feature, count(*) AS n,
@@ -273,17 +311,19 @@ pu_feature_error_rate <- function(data_storage, date_from, date_to, environment 
     WHERE s.status IS NOT NULL
       AND s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 4 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q13: median model duration by target-count bucket
 #' @keywords internal
 #' @noRd
-pu_model_duration_by_target_bucket <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_model_duration_by_target_bucket <- function(data_storage, date_from, date_to, environment = NULL,
+                                               include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT width_bucket(s.n_targets, 0, 5000, 10) AS bucket,
@@ -296,17 +336,19 @@ pu_model_duration_by_target_bucket <- function(data_storage, date_from, date_to,
     WHERE s.n_targets IS NOT NULL AND s.duration_ms IS NOT NULL
       AND s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1, 2
     ORDER BY 1
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q16: average model complexity (covariates, interactions, ratios)
 #' @keywords internal
 #' @noRd
-pu_model_complexity <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_model_complexity <- function(data_storage, date_from, date_to, environment = NULL,
+                                include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT avg(s.n_covariates) AS avg_covariates,
@@ -315,15 +357,17 @@ pu_model_complexity <- function(data_storage, date_from, date_to, environment = 
     FROM v_model_runs s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q10: QC exclusion rate by kind, method and action
 #' @keywords internal
 #' @noRd
-pu_qc_exclusion_rate <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_qc_exclusion_rate <- function(data_storage, date_from, date_to, environment = NULL,
+                                 include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.kind, s.method, s.action,
@@ -332,10 +376,11 @@ pu_qc_exclusion_rate <- function(data_storage, date_from, date_to, environment =
     FROM v_qc_exclusions s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1, 2, 3
     ORDER BY 4 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -344,7 +389,8 @@ pu_qc_exclusion_rate <- function(data_storage, date_from, date_to, environment =
 #' Q18: median time from login to first model run
 #' @keywords internal
 #' @noRd
-pu_time_to_first_model <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_time_to_first_model <- function(data_storage, date_from, date_to, environment = NULL,
+                                   include_internal = TRUE) {
   data_storage$query(
     r"(
     WITH first_model AS (
@@ -360,15 +406,17 @@ pu_time_to_first_model <- function(data_storage, date_from, date_to, environment
     WHERE s.login_time IS NOT NULL
       AND s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q19: median session length per environment
 #' @keywords internal
 #' @noRd
-pu_session_length_by_env <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_session_length_by_env <- function(data_storage, date_from, date_to, environment = NULL,
+                                     include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.environment,
@@ -378,17 +426,19 @@ pu_session_length_by_env <- function(data_storage, date_from, date_to, environme
     WHERE s.duration_s IS NOT NULL
       AND s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 1
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q20: sessions by weekday and hour
 #' @keywords internal
 #' @noRd
-pu_sessions_by_weekday_hour <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_sessions_by_weekday_hour <- function(data_storage, date_from, date_to, environment = NULL,
+                                        include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT EXTRACT(ISODOW FROM s.login_time) AS weekday,
@@ -398,10 +448,11 @@ pu_sessions_by_weekday_hour <- function(data_storage, date_from, date_to, enviro
     WHERE s.login_time IS NOT NULL
       AND s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1, 2
     ORDER BY 1, 2
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -411,7 +462,8 @@ pu_sessions_by_weekday_hour <- function(data_storage, date_from, date_to, enviro
 #' joins v_sessions for the filter)
 #' @keywords internal
 #' @noRd
-pu_time_per_tab <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_time_per_tab <- function(data_storage, date_from, date_to, environment = NULL,
+                            include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT t.tab,
@@ -423,27 +475,30 @@ pu_time_per_tab <- function(data_storage, date_from, date_to, environment = NULL
     WHERE t.seconds IS NOT NULL
       AND t.entered_at >= $1::date AND t.entered_at < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 3 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q22: first tab vs last tab per session (drop-off proxy)
 #' @keywords internal
 #' @noRd
-pu_tab_first_last <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_tab_first_last <- function(data_storage, date_from, date_to, environment = NULL,
+                              include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.first_tab, s.last_tab, count(*) AS n
     FROM v_sessions s
     WHERE s.login_time >= $1::date AND s.login_time < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1, 2
     ORDER BY 3 DESC
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -453,7 +508,8 @@ pu_tab_first_last <- function(data_storage, date_from, date_to, environment = NU
 #' only, i.e. not the tab_return auto re-run)
 #' @keywords internal
 #' @noRd
-pu_heatmap_duration_by_sample_bucket <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_heatmap_duration_by_sample_bucket <- function(data_storage, date_from, date_to,
+                                                 environment = NULL, include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT width_bucket(s.n_samples, 0, 10000, 20) AS sample_bucket,
@@ -466,17 +522,19 @@ pu_heatmap_duration_by_sample_bucket <- function(data_storage, date_from, date_t
       AND (s.trigger = 'button' OR s.trigger IS NULL)
       AND s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1, 2
     ORDER BY 1
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q25: pathway run duration by database
 #' @keywords internal
 #' @noRd
-pu_pathway_duration_by_database <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_pathway_duration_by_database <- function(data_storage, date_from, date_to, environment = NULL,
+                                            include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.database,
@@ -485,17 +543,19 @@ pu_pathway_duration_by_database <- function(data_storage, date_from, date_to, en
     FROM v_pathway_runs s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 1
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q26: tour completion rate
 #' @keywords internal
 #' @noRd
-pu_tour_completion_rate <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_tour_completion_rate <- function(data_storage, date_from, date_to, environment = NULL,
+                                    include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT s.tour,
@@ -506,10 +566,11 @@ pu_tour_completion_rate <- function(data_storage, date_from, date_to, environmen
     FROM v_tours s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     GROUP BY 1
     ORDER BY 1
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
@@ -518,7 +579,8 @@ pu_tour_completion_rate <- function(data_storage, date_from, date_to, environmen
 #' Q27: tab-based drop-off funnel, upload -> QC -> stats -> export
 #' @keywords internal
 #' @noRd
-pu_tab_funnel <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_tab_funnel <- function(data_storage, date_from, date_to, environment = NULL,
+                          include_internal = TRUE) {
   data_storage$query(
     r"(
     WITH tabs AS (
@@ -531,6 +593,7 @@ pu_tab_funnel <- function(data_storage, date_from, date_to, environment = NULL) 
         JOIN v_sessions s ON s.session = t.session
         WHERE t.entered_at >= $1::date AND t.entered_at < ($2::date + 1)
           AND ($3::text IS NULL OR s.environment = $3)
+          AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
         GROUP BY t.session
     )
     SELECT
@@ -540,14 +603,15 @@ pu_tab_funnel <- function(data_storage, date_from, date_to, environment = NULL) 
         count(*) FILTER (WHERE visited_upload AND visited_qc AND visited_stats AND visited_download) AS n_download
     FROM tabs
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q28: feature funnel by analysis, opened -> modeled -> exported
 #' @keywords internal
 #' @noRd
-pu_analysis_funnel <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_analysis_funnel <- function(data_storage, date_from, date_to, environment = NULL,
+                               include_internal = TRUE) {
   data_storage$query(
     r"(
     WITH per_analysis AS (
@@ -560,6 +624,7 @@ pu_analysis_funnel <- function(data_storage, date_from, date_to, environment = N
         WHERE fe.analysis_id IS NOT NULL
           AND fe."time" >= $1::date AND fe."time" < ($2::date + 1)
           AND ($3::text IS NULL OR s.environment = $3)
+          AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
         GROUP BY fe.analysis_id
     )
     SELECT
@@ -568,14 +633,15 @@ pu_analysis_funnel <- function(data_storage, date_from, date_to, environment = N
         count(*) FILTER (WHERE opened AND modeled AND exported) AS n_exported
     FROM per_analysis
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
 
 #' Q30: tour funnel, offered -> started -> completed
 #' @keywords internal
 #' @noRd
-pu_tour_funnel <- function(data_storage, date_from, date_to, environment = NULL) {
+pu_tour_funnel <- function(data_storage, date_from, date_to, environment = NULL,
+                           include_internal = TRUE) {
   data_storage$query(
     r"(
     SELECT
@@ -585,7 +651,8 @@ pu_tour_funnel <- function(data_storage, date_from, date_to, environment = NULL)
     FROM v_tours s
     WHERE s."time" >= $1::date AND s."time" < ($2::date + 1)
       AND ($3::text IS NULL OR s.environment = $3)
+      AND s.user_class <> 'automation' AND ($4::boolean OR s.user_class <> 'internal')
     )",
-    params = pu_params(date_from, date_to, environment)
+    params = pu_params(date_from, date_to, environment, include_internal)
   )
 }
