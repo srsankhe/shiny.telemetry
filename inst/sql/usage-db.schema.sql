@@ -878,7 +878,8 @@ FROM public.usage_tab_visits;
 -- v_daily_active -- daily active users/sessions/orgs
 -- =============================================================================
 -- One row per date x environment x user_class, so a reader can drop
--- automation / internal rows before summing. n_users and n_sessions sum
+-- automation / internal rows before summing. user_class is the last column:
+-- CREATE OR REPLACE VIEW can only append columns, never reorder them. n_users and n_sessions sum
 -- cleanly across user_class (a username has exactly one class); n_orgs does
 -- not (an org can hold users of more than one class), so sum n_orgs only
 -- within one class, or count from v_sessions directly as pu_daily_active does.
@@ -891,10 +892,10 @@ CREATE OR REPLACE VIEW public.v_daily_active AS
 SELECT
     date_trunc('day', login_time)::date AS date,
     environment,
-    user_class,
     count(DISTINCT username) AS n_users,
     count(DISTINCT session) AS n_sessions,
-    count(DISTINCT org_id) AS n_orgs
+    count(DISTINCT org_id) AS n_orgs,
+    user_class
 FROM public.v_sessions
 WHERE login_time IS NOT NULL
-GROUP BY 1, 2, 3;
+GROUP BY 1, 2, 6;
